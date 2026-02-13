@@ -63,6 +63,13 @@ from gi.repository import GObject, Nemo, Gtk, Gdk, Vte, GLib, Gio
 BASE_KEY = "org.nemo.extensions.nemo-terminal"
 settings = Gio.Settings.new(BASE_KEY)
 
+TERMINATOR_DEFAULT_FOREGROUND = "#aaaaaa"
+TERMINATOR_DEFAULT_BACKGROUND = "#000000"
+TERMINATOR_DEFAULT_PALETTE = (
+    "#2e3436:#cc0000:#4e9a06:#c4a000:#3465a4:#75507b:#06989a:#d3d7cf:"
+    "#555753:#ef2929:#8ae234:#fce94f:#729fcf:#ad7fa8:#34e2e2:#eeeeec"
+)
+
 def terminal_or_default():
     """Enforce a default value for terminal from GSettings"""
     terminalcmd = settings.get_string("terminal-shell")
@@ -85,6 +92,7 @@ class NemoTerminal(object):
         #Term
         self.shell_pid = -1
         self.term = Vte.Terminal()
+        self._apply_terminator_profile_colors()
 
         settings.bind("audible-bell", self.term, "audible-bell", Gio.SettingsBindFlags.GET)
 
@@ -207,6 +215,157 @@ class NemoTerminal(object):
         print( workingDirUri)
         # TODO: something useful (like changing the working dir)
         return
+
+    def _apply_terminator_profile_colors(self):
+        """Apply colors from Terminator profile config."""
+        profile = self._load_terminator_profile()
+        if profile and self._parse_terminator_bool(profile.get("use_theme_colors", "false")):
+            return
+
+        fg_str = TERMINATOR_DEFAULT_FOREGROUND
+        bg_str = TERMINATOR_DEFAULT_BACKGROUND
+        palette_str = TERMINATOR_DEFAULT_PALETTE
+
+        if profile:
+            fg_str = profile.get("foreground_color", fg_str)
+            bg_str = profile.get("background_color", bg_str)
+            palette_str = profile.get("palette", palette_str)
+
+        fg = Gdk.RGBA()
+        bg = Gdk.RGBA()
+        has_fg = bool(fg_str) and fg.parse(fg_str)
+        has_bg = bool(bg_str) and bg.parse(bg_str)
+
+        palette = []
+        if palette_str:
+            for color_str in palette_str.split(":"):
+                rgba = Gdk.RGBA()
+                if rgba.parse(color_str):
+                    palette.append(rgba)
+
+        if has_fg:
+            self.term.set_color_foreground(fg)
+        if has_bg:
+            self.term.set_color_background(bg)
+
+        if palette:
+            if hasattr(self.term, "set_color_palette"):
+                self.term.set_color_palette(palette)
+            elif has_fg and has_bg:
+                self.term.set_colors(fg, bg, palette)
+
+    def _load_terminator_profile(self):
+        config_path = self._get_terminator_config_path()
+        if not config_path:
+            return None
+
+        profiles = {}
+        default_layout_profile = None
+        sections = {}
+
+        try:
+            lines = self._iter_terminator_config_lines(config_path)
+            for line in lines:
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#") or stripped.startswith(";"):
+                    continue
+
+                section = self._parse_terminator_section(stripped)
+                if section:
+                    level, name = section
+                    sections[level] = name
+                    for key in list(sections.keys()):
+                        if key > level:
+                            del sections[key]
+                    continue
+
+                if "=" not in stripped:
+                    continue
+
+                key, value = [part.strip() for part in stripped.split("=", 1)]
+                value = self._strip_terminator_quotes(value)
+
+                if sections.get(1) == "profiles" and sections.get(2):
+                    profile_name = sections.get(2)
+                    profile = profiles.setdefault(profile_name, {})
+                    if key in ("foreground_color", "background_color", "palette", "use_theme_colors"):
+                        profile[key] = value
+                elif sections.get(1) == "layouts" and sections.get(2) == "default" and sections.get(3):
+                    if key == "profile" and value and not default_layout_profile:
+                        default_layout_profile = value
+        except OSError:
+            return None
+
+        if not profiles:
+            return None
+
+        if default_layout_profile and default_layout_profile in profiles:
+            return profiles[default_layout_profile]
+
+        if "default" in profiles:
+            return profiles["default"]
+
+        first_profile = next(iter(profiles.values()), None)
+        return first_profile
+
+    def _get_terminator_config_path(self):
+        xdg_config_home = os.environ.get("XDG_CONFIG_HOME", os.path.join(GLib.get_home_dir(), ".config"))
+        user_config = os.path.join(xdg_config_home, "terminator", "config")
+        if os.path.isfile(user_config):
+            return user_config
+
+        xdg_config_dirs = os.environ.get("XDG_CONFIG_DIRS", "/etc/xdg")
+        for config_dir in xdg_config_dirs.split(":"):
+            if not config_dir:
+                continue
+            system_config = os.path.join(config_dir, "terminator", "config")
+            if os.path.isfile(system_config):
+                return system_config
+
+        return None
+
+    def _iter_terminator_config_lines(self, path):
+        continuation = ""
+        with open(path, "r", encoding="utf-8") as config_file:
+            for raw_line in config_file:
+                line = raw_line.rstrip("\n")
+                stripped_line = line.rstrip()
+
+                if continuation:
+                    stripped_line = continuation + stripped_line.lstrip()
+
+                if stripped_line.endswith("\\"):
+                    continuation = stripped_line[:-1]
+                    continue
+
+                continuation = ""
+                yield stripped_line
+
+        if continuation:
+            yield continuation
+
+    def _parse_terminator_section(self, line):
+        if not line.startswith("[") or not line.endswith("]"):
+            return None
+
+        left = len(line) - len(line.lstrip("["))
+        right = len(line) - len(line.rstrip("]"))
+        if left != right or left < 1:
+            return None
+
+        name = line[left:len(line) - right].strip()
+        if not name:
+            return None
+
+        return left, name
+
+    def _strip_terminator_quotes(self, value):
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", "\""):
+            return value[1:-1]
+        return value
+
+    def _parse_terminator_bool(self, value):
+        return value.strip().lower() in ("1", "yes", "true", "on")
 
     def _paste_filenames_clipboard(self):
         """Paste to the VTE clipboard, converting URIs to literal filenames
